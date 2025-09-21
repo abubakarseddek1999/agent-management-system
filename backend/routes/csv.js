@@ -25,6 +25,83 @@ const upload = multer({
 })
 
 // ---------- CSV Upload ----------
+// router.post("/upload", auth, upload.single("csvFile"), async (req, res) => {
+//   try {
+//     if (!req.file) return res.status(400).json({ message: "No CSV file uploaded" })
+
+//     const buffer = req.file.buffer
+//     const filename = req.file.originalname
+
+//     const batch = new UploadBatch({
+//       filename,
+//       totalRecords: 0,
+//       uploadedBy: req.user._id,
+//       batchId: new mongoose.Types.ObjectId(),
+//     })
+
+//     const results = []
+//     const errors = []
+
+//     const agents = await Agent.find({ isActive: true })
+//     if (!agents.length) return res.status(400).json({ message: "No active agents available" })
+
+//     let agentIndex = 0
+
+//     await new Promise((resolve, reject) => {
+//       const readable = new stream.Readable()
+//       readable._read = () => {}
+//       readable.push(buffer)
+//       readable.push(null)
+
+//       readable
+//         .pipe(csv())
+//         .on("data", (data) => {
+//           if (!data.firstName || !data.phone) {
+//             errors.push(`Row ${results.length + 1}: Missing firstName or phone`)
+//             return
+//           }
+
+//           const assignedAgent = agents[agentIndex % agents.length]
+//           agentIndex++
+
+//           results.push({
+//             firstName: data.firstName.trim(),
+//             phone: data.phone.trim(),
+//             notes: data.notes ? data.notes.trim() : "",
+//             agentId: assignedAgent._id,
+//             batchId: batch._id,
+//           })
+//         })
+//         .on("end", resolve)
+//         .on("error", reject)
+//     })
+
+//     if (!results.length) return res.status(400).json({ message: "No valid records", warnings: errors })
+
+//     batch.totalRecords = results.length
+//     await batch.save()
+
+//     // Insert items and update agent task counts
+//     await ListItem.insertMany(results)
+//     for (const agent of agents) {
+//       const count = await ListItem.countDocuments({ agentId: agent._id })
+//       agent.assignedTasks = count
+//       await agent.save()
+//     }
+
+//     batch.status = "completed"
+//     await batch.save()
+
+//     res.json({
+//       batch,
+//       message: `Processed ${results.length} records`,
+//       ...(errors.length && { warnings: errors }),
+//     })
+//   } catch (error) {
+//     console.error("CSV upload error:", error)
+//     res.status(500).json({ message: "Server error during CSV processing", error: error.message })
+//   }
+// })
 router.post("/upload", auth, upload.single("csvFile"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No CSV file uploaded" })
@@ -92,9 +169,12 @@ router.post("/upload", auth, upload.single("csvFile"), async (req, res) => {
     batch.status = "completed"
     await batch.save()
 
+    // Response with totalItems and distributedItems
     res.json({
       batch,
       message: `Processed ${results.length} records`,
+      totalItems: results.length,
+      distributedItems: results.length, // ধরে নিচ্ছি সব valid rows distribute হয়েছে
       ...(errors.length && { warnings: errors }),
     })
   } catch (error) {
@@ -102,6 +182,7 @@ router.post("/upload", auth, upload.single("csvFile"), async (req, res) => {
     res.status(500).json({ message: "Server error during CSV processing", error: error.message })
   }
 })
+
 
 // ---------- Get all list items ----------
 router.get("/data", auth, async (req, res) => {
@@ -150,5 +231,37 @@ router.delete("/clear", auth, async (req, res) => {
     res.status(500).json({ message: "Server error while clearing data" })
   }
 })
+
+
+// ---------- Distribution stats ----------
+router.get("/distribution", auth, async (req, res) => {
+  try {
+    const agents = await Agent.find({ isActive: true })
+    const totalItems = await ListItem.countDocuments()
+    console.log(totalItems)
+
+    const distribution = await Promise.all(
+      agents.map(async (agent) => {
+        const assignedCount = await ListItem.countDocuments({ agentId: agent._id })
+        return {
+          agentId: agent._id,
+          agentName: agent.name,
+          assignedCount,
+          percentage: totalItems > 0 ? ((assignedCount / totalItems) * 100).toFixed(1) : 0,
+        }
+      }),
+    )
+
+    res.json({
+      totalItems,
+      totalAgents: agents.length,
+      distribution,
+    })
+  } catch (error) {
+    console.error("Get distribution stats error:", error)
+    res.status(500).json({ message: "Server error while fetching distribution statistics" })
+  }
+})
+
 
 module.exports = router

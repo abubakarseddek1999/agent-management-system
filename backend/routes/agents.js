@@ -304,4 +304,32 @@ router.get("/stats", auth, async (req, res) => {
   }
 })
 
+
+// ---------- Agent distribution ----------
+router.get("/distribution", auth, async (req, res) => {
+  try {
+    const agents = await Agent.find({ isActive: true })
+    const totalItems = await ListItem.countDocuments()
+    const totalAgents = agents.length
+
+    const distribution = await Promise.all(
+      agents.map(async (agent) => {
+        const assignedCount = await ListItem.countDocuments({ agentId: agent._id })
+        const percentage = totalItems > 0 ? ((assignedCount / totalItems) * 100).toFixed(2) + "%" : "0%"
+        return {
+          agentId: agent._id,
+          agentName: agent.name,
+          assignedCount,
+          percentage,
+        }
+      })
+    )
+
+    res.json({ totalItems, totalAgents, distribution })
+  } catch (error) {
+    console.error("Distribution stats error:", error)
+    res.status(500).json({ totalItems: 0, totalAgents: 0, distribution: [] })
+  }
+})
+
 module.exports = router

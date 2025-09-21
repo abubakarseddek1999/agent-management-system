@@ -54,6 +54,7 @@ export function DistributionView() {
 
       // Fetch distribution stats
       const distStats = await apiService.getDistributionStats()
+      console.log("distributionstats er data ",distStats)
       setDistributionStats(distStats)
 
       // Fetch agents

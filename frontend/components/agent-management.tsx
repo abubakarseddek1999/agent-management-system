@@ -411,7 +411,7 @@ export function AgentManagement() {
                         {agent.createdAt ? new Date(agent.createdAt).toLocaleDateString() : "N/A"}
                       </TableCell>
                       <TableCell className="text-right">
-                        <div className="flex justify-end space-x-2 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+                        <div className="flex justify-end space-x-2  opacity-100 transition-opacity duration-300">
                           <Button
                             variant="outline"
                             size="sm"
@@ -424,7 +424,7 @@ export function AgentManagement() {
                             variant="outline"
                             size="sm"
                             onClick={() => handleDelete(agent._id)}
-                            className="hover-lift text-destructive hover:text-destructive hover:bg-destructive/10 hover:border-destructive/50 transition-all duration-300"
+                            className="text-destructive bg-destructive/10 border-destructive/50 transition-all duration-300"
                           >
                             <Trash2 className="h-4 w-4" />
                           </Button>
