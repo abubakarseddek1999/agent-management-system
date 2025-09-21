@@ -1,383 +1,153 @@
 const express = require("express")
-const { v4: uuidv4 } = require("uuid")
-const path = require("path")
+const multer = require("multer")
+const csv = require("csv-parser")
+const stream = require("stream")
 const Agent = require("../models/Agent")
-const CsvData = require("../models/CsvData")
+const ListItem = require("../models/ListItem")
 const UploadBatch = require("../models/UploadBatch")
-const { authenticateToken, requireAdmin } = require("../middleware/auth")
-const upload = require("../middleware/upload")
-const { processCsvFile, processExcelFile, distributeDataAmongAgents } = require("../utils/csvProcessor")
+const auth = require("../middleware/auth")
+const { default: mongoose } = require("mongoose")
 
 const router = express.Router()
 
-// Apply authentication middleware to all routes
-router.use(authenticateToken)
-router.use(requireAdmin)
-
-// @route   POST /api/csv/upload
-// @desc    Upload and process CSV/Excel file
-// @access  Private (Admin only)
-router.post("/upload", upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: "No file uploaded",
-      })
-    }
-
-    const fileExtension = path.extname(req.file.originalname).toLowerCase()
-    let processedData
-
-    // Process file based on type
-    if (fileExtension === ".csv") {
-      processedData = await processCsvFile(req.file.buffer)
-    } else if (fileExtension === ".xlsx" || fileExtension === ".xls") {
-      processedData = processExcelFile(req.file.buffer)
+// ---------- Multer memory storage for Vercel ----------
+const storage = multer.memoryStorage()
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === "text/csv" || file.originalname.endsWith(".csv")) {
+      cb(null, true)
     } else {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid file type",
-      })
+      cb(new Error("Only CSV files are allowed"), false)
     }
+  },
+})
 
-    const { data, errors } = processedData
+// ---------- CSV Upload ----------
+router.post("/upload", auth, upload.single("csvFile"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No CSV file uploaded" })
 
-    // Check if there's any valid data
-    if (data.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "No valid data found in the file",
-        errors: errors,
-      })
-    }
+    const buffer = req.file.buffer
+    const filename = req.file.originalname
 
-    // Get active agents for distribution
-    const activeAgents = await Agent.find({ isActive: true }).select("_id name email")
-
-    if (activeAgents.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "No active agents available for task distribution",
-      })
-    }
-
-    // Generate batch ID
-    const batchId = uuidv4()
-
-    // Distribute data among agents
-    const distribution = distributeDataAmongAgents(data, activeAgents)
-
-    // Create upload batch record
-    const uploadBatch = new UploadBatch({
-      batchId,
-      fileName: req.file.originalname,
-      totalRecords: data.length,
-      processedRecords: 0,
-      failedRecords: errors.length,
-      status: "processing",
-      distributionSummary: distribution.map((dist) => ({
-        agentId: dist.agent._id,
-        agentName: dist.agent.name,
-        assignedCount: dist.count,
-      })),
+    const batch = new UploadBatch({
+      filename,
+      totalRecords: 0,
       uploadedBy: req.user._id,
-      errors: errors,
+      batchId: new mongoose.Types.ObjectId(),
     })
 
-    await uploadBatch.save()
+    const results = []
+    const errors = []
 
-    // Save distributed data to database
-    const csvDataPromises = []
+    const agents = await Agent.find({ isActive: true })
+    if (!agents.length) return res.status(400).json({ message: "No active agents available" })
 
-    distribution.forEach((dist) => {
-      dist.data.forEach((item) => {
-        csvDataPromises.push(
-          new CsvData({
-            firstName: item.firstName,
-            phone: item.phone,
-            notes: item.notes,
-            assignedTo: dist.agent._id,
-            uploadBatch: batchId,
-            uploadedBy: req.user._id,
-          }).save(),
-        )
-      })
+    let agentIndex = 0
+
+    await new Promise((resolve, reject) => {
+      const readable = new stream.Readable()
+      readable._read = () => {}
+      readable.push(buffer)
+      readable.push(null)
+
+      readable
+        .pipe(csv())
+        .on("data", (data) => {
+          if (!data.firstName || !data.phone) {
+            errors.push(`Row ${results.length + 1}: Missing firstName or phone`)
+            return
+          }
+
+          const assignedAgent = agents[agentIndex % agents.length]
+          agentIndex++
+
+          results.push({
+            firstName: data.firstName.trim(),
+            phone: data.phone.trim(),
+            notes: data.notes ? data.notes.trim() : "",
+            agentId: assignedAgent._id,
+            batchId: batch._id,
+          })
+        })
+        .on("end", resolve)
+        .on("error", reject)
     })
 
-    // Execute all saves
-    await Promise.all(csvDataPromises)
+    if (!results.length) return res.status(400).json({ message: "No valid records", warnings: errors })
 
-    // Update batch status
-    uploadBatch.processedRecords = data.length
-    uploadBatch.status = errors.length > 0 ? "partial" : "completed"
-    await uploadBatch.save()
+    batch.totalRecords = results.length
+    await batch.save()
 
-    res.status(200).json({
-      success: true,
-      message: "File processed and distributed successfully",
-      data: {
-        batchId,
-        totalRecords: data.length,
-        processedRecords: data.length,
-        failedRecords: errors.length,
-        distribution: distribution.map((dist) => ({
-          agentId: dist.agent._id,
-          agentName: dist.agent.name,
-          agentEmail: dist.agent.email,
-          assignedCount: dist.count,
-        })),
-        errors: errors.length > 0 ? errors : undefined,
-      },
+    // Insert items and update agent task counts
+    await ListItem.insertMany(results)
+    for (const agent of agents) {
+      const count = await ListItem.countDocuments({ agentId: agent._id })
+      agent.assignedTasks = count
+      await agent.save()
+    }
+
+    batch.status = "completed"
+    await batch.save()
+
+    res.json({
+      batch,
+      message: `Processed ${results.length} records`,
+      ...(errors.length && { warnings: errors }),
     })
   } catch (error) {
     console.error("CSV upload error:", error)
-
-    // Handle multer errors
-    if (error.code === "LIMIT_FILE_SIZE") {
-      return res.status(400).json({
-        success: false,
-        message: "File size too large. Maximum size is 10MB.",
-      })
-    }
-
-    if (error.message.includes("Invalid file type")) {
-      return res.status(400).json({
-        success: false,
-        message: error.message,
-      })
-    }
-
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    })
+    res.status(500).json({ message: "Server error during CSV processing", error: error.message })
   }
 })
 
-// @route   GET /api/csv/batches
-// @desc    Get all upload batches with pagination
-// @access  Private (Admin only)
-router.get("/batches", async (req, res) => {
+// ---------- Get all list items ----------
+router.get("/data", auth, async (req, res) => {
   try {
-    const page = Number.parseInt(req.query.page) || 1
-    const limit = Number.parseInt(req.query.limit) || 10
+    const items = await ListItem.find().populate("agentId", "name email").sort({ createdAt: -1 })
+    res.json(items)
+  } catch (error) {
+    console.error("Get list items error:", error)
+    res.status(500).json({ message: "Server error while fetching list items" })
+  }
+})
 
-    const totalBatches = await UploadBatch.countDocuments()
-
-    const batches = await UploadBatch.find()
+// ---------- Get items by agent ----------
+router.get("/data/agent/:agentId", auth, async (req, res) => {
+  try {
+    const items = await ListItem.find({ agentId: req.params.agentId })
+      .populate("agentId", "name email")
       .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .populate("uploadedBy", "email")
+    res.json(items)
+  } catch (error) {
+    console.error("Get agent items error:", error)
+    res.status(500).json({ message: "Server error while fetching agent items" })
+  }
+})
 
-    res.status(200).json({
-      success: true,
-      data: {
-        batches,
-        pagination: {
-          currentPage: page,
-          totalPages: Math.ceil(totalBatches / limit),
-          totalBatches,
-          hasNextPage: page < Math.ceil(totalBatches / limit),
-          hasPrevPage: page > 1,
-        },
-      },
-    })
+// ---------- Get batch history ----------
+router.get("/batches", auth, async (req, res) => {
+  try {
+    const batches = await UploadBatch.find().populate("uploadedBy", "name email").sort({ createdAt: -1 })
+    res.json(batches)
   } catch (error) {
     console.error("Get batches error:", error)
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    })
+    res.status(500).json({ message: "Server error while fetching upload batches" })
   }
 })
 
-// @route   GET /api/csv/batches/:batchId
-// @desc    Get specific batch details with distributed data
-// @access  Private (Admin only)
-router.get("/batches/:batchId", async (req, res) => {
+// ---------- Clear all CSV data ----------
+router.delete("/clear", auth, async (req, res) => {
   try {
-    const { batchId } = req.params
-
-    const batch = await UploadBatch.findOne({ batchId }).populate("uploadedBy", "email")
-
-    if (!batch) {
-      return res.status(404).json({
-        success: false,
-        message: "Batch not found",
-      })
-    }
-
-    // Get distributed data
-    const distributedData = await CsvData.find({ uploadBatch: batchId })
-      .populate("assignedTo", "name email")
-      .sort({ createdAt: 1 })
-
-    // Group data by agent
-    const dataByAgent = distributedData.reduce((acc, item) => {
-      const agentId = item.assignedTo._id.toString()
-      if (!acc[agentId]) {
-        acc[agentId] = {
-          agent: item.assignedTo,
-          data: [],
-        }
-      }
-      acc[agentId].data.push({
-        _id: item._id,
-        firstName: item.firstName,
-        phone: item.phone,
-        notes: item.notes,
-        status: item.status,
-        createdAt: item.createdAt,
-      })
-      return acc
-    }, {})
-
-    res.status(200).json({
-      success: true,
-      data: {
-        batch,
-        distributedData: Object.values(dataByAgent),
-      },
-    })
+    await ListItem.deleteMany({})
+    await UploadBatch.deleteMany({})
+    await Agent.updateMany({}, { assignedTasks: 0 })
+    res.json({ message: "All CSV data cleared successfully" })
   } catch (error) {
-    console.error("Get batch details error:", error)
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    })
-  }
-})
-
-// @route   GET /api/csv/agent/:agentId/tasks
-// @desc    Get tasks assigned to specific agent
-// @access  Private (Admin only)
-router.get("/agent/:agentId/tasks", async (req, res) => {
-  try {
-    const { agentId } = req.params
-    const page = Number.parseInt(req.query.page) || 1
-    const limit = Number.parseInt(req.query.limit) || 10
-    const status = req.query.status
-
-    // Build query
-    const query = { assignedTo: agentId }
-    if (status) {
-      query.status = status
-    }
-
-    const totalTasks = await CsvData.countDocuments(query)
-
-    const tasks = await CsvData.find(query)
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .populate("assignedTo", "name email")
-      .populate("uploadedBy", "email")
-
-    res.status(200).json({
-      success: true,
-      data: {
-        tasks,
-        pagination: {
-          currentPage: page,
-          totalPages: Math.ceil(totalTasks / limit),
-          totalTasks,
-          hasNextPage: page < Math.ceil(totalTasks / limit),
-          hasPrevPage: page > 1,
-        },
-      },
-    })
-  } catch (error) {
-    console.error("Get agent tasks error:", error)
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    })
-  }
-})
-
-// @route   PUT /api/csv/task/:taskId/status
-// @desc    Update task status
-// @access  Private (Admin only)
-router.put("/task/:taskId/status", async (req, res) => {
-  try {
-    const { taskId } = req.params
-    const { status } = req.body
-
-    if (!["pending", "in-progress", "completed", "cancelled"].includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid status value",
-      })
-    }
-
-    const task = await CsvData.findById(taskId)
-
-    if (!task) {
-      return res.status(404).json({
-        success: false,
-        message: "Task not found",
-      })
-    }
-
-    task.status = status
-    await task.save()
-
-    res.status(200).json({
-      success: true,
-      message: "Task status updated successfully",
-      data: {
-        task,
-      },
-    })
-  } catch (error) {
-    console.error("Update task status error:", error)
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    })
-  }
-})
-
-// @route   GET /api/csv/stats/overview
-// @desc    Get CSV processing statistics
-// @access  Private (Admin only)
-router.get("/stats/overview", async (req, res) => {
-  try {
-    const totalBatches = await UploadBatch.countDocuments()
-    const totalTasks = await CsvData.countDocuments()
-
-    // Task status distribution
-    const statusStats = await CsvData.aggregate([
-      {
-        $group: {
-          _id: "$status",
-          count: { $sum: 1 },
-        },
-      },
-    ])
-
-    // Recent batches
-    const recentBatches = await UploadBatch.find().sort({ createdAt: -1 }).limit(5).populate("uploadedBy", "email")
-
-    res.status(200).json({
-      success: true,
-      data: {
-        overview: {
-          totalBatches,
-          totalTasks,
-        },
-        statusStats,
-        recentBatches,
-      },
-    })
-  } catch (error) {
-    console.error("Get CSV stats error:", error)
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    })
+    console.error("Clear data error:", error)
+    res.status(500).json({ message: "Server error while clearing data" })
   }
 })
 

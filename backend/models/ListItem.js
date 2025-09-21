@@ -1,6 +1,6 @@
 const mongoose = require("mongoose")
 
-const csvDataSchema = new mongoose.Schema(
+const listItemSchema = new mongoose.Schema(
   {
     firstName: {
       type: String,
@@ -12,7 +12,7 @@ const csvDataSchema = new mongoose.Schema(
       type: String,
       required: [true, "Phone number is required"],
       trim: true,
-      match: [/^\+?[1-9]\d{1,14}$/, "Please enter a valid phone number"],
+      match: [/^[+]?[1-9][\d]{0,15}$/, "Please enter a valid phone number"],
     },
     notes: {
       type: String,
@@ -20,25 +20,19 @@ const csvDataSchema = new mongoose.Schema(
       maxlength: [500, "Notes cannot exceed 500 characters"],
       default: "",
     },
-    assignedTo: {
+    agentId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Agent",
-      required: true,
+      required: [true, "Agent assignment is required"],
     },
-    uploadBatch: {
-      type: String,
-      required: true,
-      index: true,
+    batchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "UploadBatch",
     },
     status: {
       type: String,
-      enum: ["pending", "in-progress", "completed", "cancelled"],
+      enum: ["pending", "contacted", "completed"],
       default: "pending",
-    },
-    uploadedBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
     },
   },
   {
@@ -46,8 +40,9 @@ const csvDataSchema = new mongoose.Schema(
   },
 )
 
-// Index for efficient queries
-csvDataSchema.index({ uploadBatch: 1, assignedTo: 1 })
-csvDataSchema.index({ assignedTo: 1, status: 1 })
+// Indexes for better query performance
+listItemSchema.index({ agentId: 1 })
+listItemSchema.index({ batchId: 1 })
+listItemSchema.index({ status: 1 })
 
-module.exports = mongoose.model("CsvData", csvDataSchema)
+module.exports = mongoose.model("ListItem", listItemSchema)
